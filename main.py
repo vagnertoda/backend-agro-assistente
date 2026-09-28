@@ -98,12 +98,117 @@ def criar_lote_engorda(numero_ou_nome_lote: str, quantidade_animais: int, finali
     except Exception as e:
         return f"Erro ao criar lote no banco de dados: {str(e)}"
 
+def consultar_lotes_fazenda(nome_ou_numero_lote: str = "") -> str:
+    """
+    Consulta os lotes de gado cadastrados no banco de dados Firestore.
+    Use quando o usuário perguntar quantas cabeças/animais tem em um lote específico (ex: 'quantas cabeças tem no lote 5?'),
+    quais lotes existem na fazenda, ou pedir detalhes de um lote.
+    Se nome_ou_numero_lote estiver vazio ou for geral, lista todos os lotes cadastrados.
+    """
+    try:
+        if db is None:
+            return "Banco de dados Firestore não está conectado no momento."
+        
+        colecao_lotes = db.collection("lotes_fazenda")
+        termo = (nome_ou_numero_lote or "").strip().lower()
+        
+        # Se um lote específico foi pedido
+        if termo and termo not in ["todos", "geral", "tudo", "listar"]:
+            id_direto = termo.replace(" ", "_")
+            doc = colecao_lotes.document(id_direto).get()
+            
+            # Se não achou diretamente, tenta prefixo lote_ (ex: '5' -> 'lote_5')
+            if not doc.exists and not id_direto.startswith("lote_"):
+                doc = colecao_lotes.document(f"lote_{id_direto}").get()
+                
+            # Se ainda não achou, faz uma busca por aproximação nos documentos
+            if not doc.exists:
+                for d in colecao_lotes.stream():
+                    dados = d.to_dict()
+                    nome = str(dados.get("nome_lote", "")).lower()
+                    if termo in nome or termo in d.id:
+                        doc = d
+                        break
+                        
+            if doc and doc.exists:
+                dados = doc.to_dict()
+                nome = dados.get("nome_lote", doc.id)
+                qtd = dados.get("quantidade_cabecas", 0)
+                finalidade = dados.get("finalidade", "não informada")
+                status = dados.get("status", "ativo")
+                resposta = f"Lote '{nome}': {qtd} cabeças de gado. Finalidade: {finalidade}. Status: {status}."
+                
+                # Verifica se há registro de cocho recente
+                try:
+                    doc_consumo = db.collection("consumo_cocho").document(doc.id).get()
+                    if doc_consumo.exists:
+                        c_dados = doc_consumo.to_dict()
+                        acumulado = c_dados.get("consumo_acumulado_kg", 0)
+                        ultimo_insumo = c_dados.get("ultimo_insumo", "ração")
+                        resposta += f" Consumo acumulado no cocho: {acumulado} kg (Último insumo: {ultimo_insumo})."
+                except Exception:
+                    pass
+                return resposta
+            else:
+                return f"Não encontrei o lote '{nome_ou_numero_lote}' cadastrado no banco de dados."
+                
+        # Se pediu todos ou não especificou
+        docs = list(colecao_lotes.stream())
+        if not docs:
+            return "Nenhum lote cadastrado no banco de dados da fazenda até o momento."
+            
+        resposta = "Lotes cadastrados na fazenda:\n"
+        for d in docs:
+            dados = d.to_dict()
+            nome = dados.get("nome_lote", d.id)
+            qtd = dados.get("quantidade_cabecas", 0)
+            finalidade = dados.get("finalidade", "não informada")
+            status = dados.get("status", "ativo")
+            resposta += f"- {nome}: {qtd} cabeças (Finalidade: {finalidade}, Status: {status})\n"
+        return resposta.strip()
+    except Exception as e:
+        return f"Erro ao consultar lotes no banco de dados: {str(e)}"
+
+def listar_bulas_existentes() -> str:
+    """
+    Lista todos os medicamentos, bulas veterinárias e manuais técnicos disponíveis no banco de dados Firestore.
+    Use quando o usuário perguntar quais remédios, bulas ou manuais estão cadastrados no sistema.
+    """
+    try:
+        if db is None:
+            return "Banco de dados Firestore não está conectado no momento."
+            
+        docs = list(db.collection("bulas_conhecimento").stream())
+        if not docs:
+            return "Nenhuma bula ou manual técnico cadastrado no banco de dados."
+            
+        medicamentos = set()
+        for d in docs:
+            med = d.to_dict().get("medicamento")
+            if med:
+                medicamentos.add(med)
+                
+        if not medicamentos:
+            return "Nenhuma bula identificada na base de conhecimento."
+            
+        lista_formatada = sorted(list(medicamentos))
+        resposta = "Medicamentos e manuais técnicos cadastrados na base de conhecimento:\n"
+        for item in lista_formatada:
+            resposta += f"- {item}\n"
+        resposta += "\nPode me perguntar sobre dosagem, período de carência, modo de aplicação ou indicação de qualquer um deles."
+        return resposta
+    except Exception as e:
+        return f"Erro ao listar bulas no banco de dados: {str(e)}"
+
 def consultar_bula_medicamento(duvida_sintoma_ou_medicamento: str) -> str:
     """
     Busca informações técnicas em bulas veterinárias e manuais (ex: dose, invermectina, carência).
     Use SEMPRE que o usuário fizer perguntas técnicas de saúde animal ou dosagem.
     """
     try:
+        if db is None:
+            return "Banco de dados de bulas offline no momento."
+
         # 1. Transforma a pergunta em vetor
         resposta_vetor = client.models.embed_content(
             model='gemini-embedding-001',
@@ -121,7 +226,23 @@ def consultar_bula_medicamento(duvida_sintoma_ou_medicamento: str) -> str:
         ).get()
         
         if not resultados:
-            return "Não encontrei informações sobre isso na base de dados das bulas."
+            # Fallback para busca textual simples caso vetor retorne vazio
+            termo = duvida_sintoma_ou_medicamento.lower()
+            encontrados = []
+            for doc in db.collection("bulas_conhecimento").limit(20).stream():
+                dados = doc.to_dict()
+                med = str(dados.get("medicamento", "")).lower()
+                conteudo = str(dados.get("conteudo_texto", ""))
+                if termo in med or termo in conteudo.lower():
+                    encontrados.append(dados)
+                    if len(encontrados) >= 2:
+                        break
+            if not encontrados:
+                return f"Não encontrei informações sobre '{duvida_sintoma_ou_medicamento}' na base de dados das bulas."
+            contexto_rag = f"Resultados das bulas para '{duvida_sintoma_ou_medicamento}':\n"
+            for dados in encontrados:
+                contexto_rag += f"--- {dados.get('medicamento')} ---\n{dados.get('conteudo_texto')}\n\n"
+            return contexto_rag
 
         contexto_rag = f"Resultados das bulas para '{duvida_sintoma_ou_medicamento}':\n"
         for doc in resultados:
@@ -156,13 +277,21 @@ def processar_comando_ia(payload: ComandoPWA, usuario: dict = Depends(verificar_
             "SUAS REGRAS DE COMPORTAMENTO:\n"
             "1. Fale de forma simples, direta e educada, usando leve linguajar caipira, mas sem exageros caricatos.\n"
             "2. Seja MUITO RESUMIDO. Não dê respostas longas. Vá direto ao ponto.\n"
-            "3. Se o peão mandar registrar consumo ou criar um lote, use as ferramentas disponíveis.\n"
-            "4. Se fizerem perguntas sobre dosagem de remédio (ex: Invermectina, vacinas), OBRIGATORIAMENTE use a ferramenta 'consultar_bula_medicamento' antes de responder. Baseie sua resposta apenas no que a ferramenta retornar."
+            "3. Se o peão mandar registrar consumo ou criar um lote, use as ferramentas correspondentes.\n"
+            "4. Se o usuário perguntar quantas cabeças de gado tem em um lote, quais lotes existem ou pedir detalhes de um lote, use OBRIGATORIAMENTE a ferramenta 'consultar_lotes_fazenda'.\n"
+            "5. Se o usuário perguntar quais bulas, medicamentos ou manuais estão cadastrados/disponíveis no sistema, use a ferramenta 'listar_bulas_existentes'.\n"
+            "6. Se fizerem perguntas sobre dosagem de remédio (ex: Invermectina, vacinas, carência, modo de usar), OBRIGATORIAMENTE use a ferramenta 'consultar_bula_medicamento' antes de responder. Baseie sua resposta apenas no que a ferramenta retornar."
         )
 
         configuracao_ia = types.GenerateContentConfig(
             # Adicionamos todas as ferramentas que criamos aqui:
-            tools=[registrar_consumo_cocho, criar_lote_engorda, consultar_bula_medicamento],
+            tools=[
+                registrar_consumo_cocho,
+                criar_lote_engorda,
+                consultar_lotes_fazenda,
+                listar_bulas_existentes,
+                consultar_bula_medicamento
+            ],
             system_instruction=instrucao_melhorada,
             temperature=0.3 # Mantém a IA mais focada e menos "inventiva"
         )
@@ -219,6 +348,34 @@ def health_check():
         "status": "online", 
         "mensagem": "API do AgroAssistente operando 100%!"
     }
+
+# Rota para consulta direta dos lotes cadastrados
+@app.get("/api/lotes")
+def listar_lotes_api(usuario: dict = Depends(verificar_token_firebase)):
+    try:
+        if db is None:
+            return {"lotes": [], "mensagem": "Banco de dados Firestore offline."}
+        docs = db.collection("lotes_fazenda").stream()
+        lotes = []
+        for d in docs:
+            dados = d.to_dict()
+            dados["id"] = d.id
+            lotes.append(dados)
+        return {"total": len(lotes), "lotes": lotes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar lotes: {str(e)}")
+
+# Rota para consulta direta das bulas cadastradas
+@app.get("/api/bulas")
+def listar_bulas_api(usuario: dict = Depends(verificar_token_firebase)):
+    try:
+        if db is None:
+            return {"bulas": [], "mensagem": "Banco de dados Firestore offline."}
+        docs = db.collection("bulas_conhecimento").stream()
+        medicamentos = sorted(list(set(d.to_dict().get("medicamento") for d in docs if d.to_dict().get("medicamento"))))
+        return {"total": len(medicamentos), "bulas": medicamentos}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar bulas: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

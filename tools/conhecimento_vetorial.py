@@ -108,3 +108,30 @@ def consultar_bula_medicamento(duvida_sintoma_ou_medicamento: str) -> str:
 
     contexto += "*Instrução para IA: Sintetize as informações em linguagem caipira e direta. É OBRIGATÓRIO lembrar o peão de conferir com o veterinário da fazenda antes da aplicação.*"
     return contexto
+
+def listar_bulas_existentes() -> str:
+    """
+    Lista todos os medicamentos, bulas veterinárias e manuais técnicos disponíveis no banco de dados Firestore.
+    """
+    try:
+        if db is not None:
+            docs = list(db.collection("bulas_conhecimento").stream())
+            medicamentos = set()
+            for d in docs:
+                med = d.to_dict().get("medicamento")
+                if med:
+                    medicamentos.add(med)
+            if medicamentos:
+                lista = sorted(list(medicamentos))
+                res = "📚 **Bulas e Manuais Disponíveis no Banco:**\n"
+                for item in lista:
+                    res += f"- {item}\n"
+                return res
+
+        # Fallback para base local
+        res = "📚 **Bulas e Manuais Disponíveis (Base Local):**\n"
+        for bula in BASE_BULAS_FALLBACK.values():
+            res += f"- {bula['medicamento']}\n"
+        return res
+    except Exception as e:
+        return f"Erro ao consultar bulas: {str(e)}"
